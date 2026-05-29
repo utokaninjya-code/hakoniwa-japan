@@ -54,24 +54,14 @@ export default function App() {
       {/* キャリブレーション結果 */}
       {calibrationResults && (
         <div className="bg-gray-800 rounded-lg p-6">
-          <h2 className="text-lg font-bold mb-4 flex items-center gap-3">
-            キャリブレーション結果
-            <span className={`text-sm font-normal px-2 py-1 rounded ${
-              calibrationResults.allPassed
-                ? 'bg-green-800 text-green-200'
-                : 'bg-yellow-800 text-yellow-200'
-            }`}>
-              {calibrationResults.allPassed ? '✅ 全項目OK' : '⚠️ 要調整あり'}
-            </span>
-          </h2>
+          <h2 className="text-lg font-bold mb-4">キャリブレーション結果</h2>
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-gray-400 border-b border-gray-700 text-right">
+              <tr className="text-gray-400 border-b border-gray-700">
                 <th className="text-left py-2 pr-4">指標</th>
-                <th className="py-2 px-4">実測値</th>
-                <th className="py-2 px-4">目標値</th>
-                <th className="py-2 px-4">乖離</th>
-                <th className="py-2">判定</th>
+                <th className="text-right py-2 px-4">実測値</th>
+                <th className="text-right py-2 px-4">目標値</th>
+                <th className="text-right py-2">乖離</th>
               </tr>
             </thead>
             <tbody>
@@ -84,13 +74,8 @@ export default function App() {
                   <td className="text-right py-2 px-4 font-mono text-gray-400">
                     {formatCalibValue(r.metric, r.target)}
                   </td>
-                  <td className={`text-right py-2 px-4 font-mono ${
-                    r.passed ? 'text-green-400' : 'text-yellow-400'
-                  }`}>
+                  <td className="text-right py-2 font-mono text-gray-300">
                     {(r.deviation * 100).toFixed(1)}%
-                  </td>
-                  <td className="text-right py-2">
-                    {r.passed ? '✅' : '⚠️'}
                   </td>
                 </tr>
               ))}
