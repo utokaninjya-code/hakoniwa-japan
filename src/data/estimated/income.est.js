@@ -107,4 +107,5 @@ export const EST_INCOME_LOGNORMAL_SIGMA = 0.35;
 //   40歳の値（514万円）と産業係数・学歴係数で整合させた基準点。
 //   全補正係数が1.0のときにこの値が中央値となる。
 // ─────────────────────────────────────────────────────────────
-export const EST_BASE_ANNUAL_INCOME = 5_140_000; // 514万円
+// @adjustment キャリブレーションで正規平均年収が18%低かったため引き上げ
+export const EST_BASE_ANNUAL_INCOME = 6_200_000; // 620万円（補正後）

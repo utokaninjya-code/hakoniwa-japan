@@ -12,8 +12,9 @@ import {
 } from '../data/index.js';
 import { generateSimulation } from '../engine/agentFactory.js';
 import { runTurn } from '../engine/simulationEngine.js';
+import { validateAgents } from '../engine/calibration.js';
 
-const MAX_HISTORY = 40; // 最大40ターン（20年分）
+const MAX_HISTORY = 40;
 
 const initialTaxPolicy = {
   incomeTaxBrackets:          [...STAT_INCOME_TAX_BRACKETS],
@@ -32,19 +33,25 @@ const initialTaxPolicy = {
 };
 
 export const useSimulationStore = create((set, get) => ({
-  agents:       [],
-  households:   [],
-  macroHistory: [],
-  taxPolicy:    initialTaxPolicy,
-  isRunning:    false,
+  agents:             [],
+  households:         [],
+  macroHistory:       [],
+  taxPolicy:          initialTaxPolicy,
+  isRunning:          false,
+  calibrationResults: null,
 
   initSimulation: (count = 1000) => {
     const { agents, households } = generateSimulation(count, get().taxPolicy);
     const macro = runTurn(agents, households, get().taxPolicy);
+
+    // 税計算後にキャリブレーション実行
+    const calibrationResults = validateAgents(agents, households);
+
     set({
       agents,
       households,
-      macroHistory: [macro],
+      macroHistory:       [macro],
+      calibrationResults,
     });
   },
 
@@ -58,6 +65,13 @@ export const useSimulationStore = create((set, get) => ({
       households:   [...households],
       macroHistory: [...macroHistory.slice(-MAX_HISTORY + 1), macro],
     });
+  },
+
+  runCalibration: () => {
+    const { agents, households } = get();
+    if (agents.length === 0) return;
+    const calibrationResults = validateAgents(agents, households);
+    set({ calibrationResults });
   },
 
   updateTaxPolicy: (patch) => {

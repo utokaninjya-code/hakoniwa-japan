@@ -110,6 +110,9 @@ export function aggregateMacro(agents, households, govPolicy, prevMacro) {
     welfareCoverageRate,
     welfareNonReceiptBreakdown,
     meanDisposableIncome: mean(disposableIncomes),
+    meanDisposableIncomeEmployed: mean(
+      employed.map(a => Math.max(0, a.disposableIncome ?? 0))
+    ),
     meanHappiness: mean(agents.map(a => a.happiness ?? 0)),
     meanGovTrust: mean(agents.map(a => a.govTrust ?? 0)),
     meanHealth: mean(agents.map(a => a.health ?? 0)),

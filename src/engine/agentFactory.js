@@ -1,6 +1,6 @@
 /**
  * src/engine/agentFactory.js
- * 世帯・エージェントの生成
+ * 世帯・エージェントの生成（年齢分布ファースト方式）
  */
 
 import {
@@ -58,7 +58,6 @@ function nextId(prefix, counter) {
   return `${prefix}-${String(counter).padStart(4, '0')}`;
 }
 
-// 年齢5歳刻みテーブルから最も近いキーを返す
 function floorKey(table, age) {
   const keys = Object.keys(table).map(Number).sort((a, b) => a - b);
   let result = keys[0];
@@ -69,29 +68,24 @@ function floorKey(table, age) {
   return result;
 }
 
-// 5歳刻みテーブルから補間値を取得
 function lookupByAge(table, age) {
   return table[floorKey(table, age)];
 }
 
-// 年齢区分から労働力率を取得（性別別）
 function getLaborForceRate(gender, age) {
   const table = STAT_LABOR_FORCE_RATE[gender === 'M' ? 'male' : 'female'];
   return lookupByAge(table, age) ?? 0;
 }
 
-// 年齢区分から正規雇用率を取得
 function getRegularRate(gender, age) {
   const table = STAT_REGULAR_EMPLOYMENT_RATE[gender === 'M' ? 'male' : 'female'];
   return lookupByAge(table, age) ?? 0.5;
 }
 
-// 年齢区分から失業率を取得
 function getUnemploymentRate(age) {
   return lookupByAge(STAT_UNEMPLOYMENT_RATE.by_age, age) ?? STAT_UNEMPLOYMENT_RATE.overall;
 }
 
-// 出生年から大学進学率コーホートを取得
 function getUniversityRateByCohort(birthYear) {
   const decade = Math.floor(birthYear / 10) * 10;
   const keys = Object.keys(STAT_UNIVERSITY_ENROLLMENT_RATE_BY_BIRTH_DECADE).map(Number).sort((a, b) => a - b);
@@ -99,94 +93,128 @@ function getUniversityRateByCohort(birthYear) {
   return STAT_UNIVERSITY_ENROLLMENT_RATE_BY_BIRTH_DECADE[clampedDecade] ?? 0.537;
 }
 
-// 単独世帯の世帯主年齢をサンプリング（三峰性）
-function sampleSingleAge(region) {
-  const params = EST_HOUSEHOLD_AGE_PARAMS.headAgeDistribution.single;
-  // 都市部は若年ピーク大きめ、農村は高齢ピーク大きめ
-  const weights = region === 'urban'
-    ? [0.40, 0.30, 0.30]
-    : region === 'suburban'
-    ? [0.30, 0.35, 0.35]
-    : [0.20, 0.30, 0.50];
+// ─── Step 1: 全エージェントの年齢・性別・地域をサンプリング ──
 
-  const peak = weightedSample([
-    { value: 'young',   weight: weights[0] },
-    { value: 'middle',  weight: weights[1] },
-    { value: 'elderly', weight: weights[2] },
-  ]);
-  const p = params[`${peak}Peak`];
-  return clamp(Math.round(gaussianRandom(p.mean, p.stdDev)), p.ageMin, p.ageMax);
+function sampleAgeDemographics(count) {
+  return Array.from({ length: count }, (_, i) => {
+    const ageBucket = sampleFromDistribution(STAT_AGE_5YEAR_DISTRIBUTION);
+    const age = randomInt(ageBucket.ageMin, ageBucket.ageMax);
+    const gender = Math.random() < STAT_SEX_RATIO.male ? 'M' : 'F';
+    const region = sampleFromDistribution(STAT_REGION_DISTRIBUTION).region;
+    return { index: i, age, gender, region };
+  });
 }
 
-// ─── 世帯生成 ────────────────────────────────────────────────
+// ─── Step 2: 年齢から世帯タイプを決定 ────────────────────────
 
-export function generateHouseholds(targetAgentCount = 1000) {
+function determineHouseholdType(age, gender) {
+  if (age < 18)  return 'single';
+  if (age >= 75) return Math.random() < 0.70 ? 'single' : 'couple';
+  if (age >= 65) {
+    const r = Math.random();
+    return r < 0.50 ? 'single' : r < 0.85 ? 'couple' : 'three_generation';
+  }
+  return sampleFromDistribution(STAT_HOUSEHOLD_TYPE_DIST).type;
+}
+
+// ─── Step 3: 年齢の近いエージェントを世帯にグループ化 ────────
+
+function buildHouseholdsFromDemographics(agentSeeds) {
+  const sorted = [...agentSeeds].sort((a, b) => b.age - a.age);
+  const assigned = new Set();
   const households = [];
-  let totalMembers = 0;
+  const agentHouseholdMap = {};
   let hhCounter = 1;
 
-  while (totalMembers < targetAgentCount) {
-    const hhType = sampleFromDistribution(STAT_HOUSEHOLD_TYPE_DIST).type;
-    const region = sampleFromDistribution(STAT_REGION_DISTRIBUTION).region;
+  for (const seed of sorted) {
+    if (assigned.has(seed.index)) continue;
 
-    // 世帯人数を決定
-    const meanSize = STAT_HOUSEHOLD_MEAN_SIZE[hhType];
-    let memberCount;
-    if (hhType === 'single') {
-      memberCount = 1;
-    } else if (hhType === 'couple') {
-      memberCount = 2;
-    } else if (hhType === 'couple_with_child') {
-      const childDist = STAT_CHILDREN_PER_FAMILY.dist;
-      const childCount = sampleFromDistribution(childDist).count;
-      memberCount = 2 + childCount;
-    } else if (hhType === 'single_parent') {
-      const childCount = Math.max(1, Math.round(gaussianRandom(meanSize - 1, 0.5)));
-      memberCount = 1 + clamp(childCount, 1, 4);
-    } else if (hhType === 'three_generation') {
-      memberCount = Math.max(3, Math.round(gaussianRandom(meanSize, 0.8)));
-    } else {
-      memberCount = Math.max(2, Math.round(gaussianRandom(meanSize, 0.7)));
+    const hhType = determineHouseholdType(seed.age, seed.gender);
+    const hhId = nextId('hh', hhCounter++);
+    const region = seed.region;
+    const memberSeeds = [seed];
+    assigned.add(seed.index);
+
+    if (hhType === 'couple' || hhType === 'couple_with_child') {
+      // 配偶者候補：同世代の異性・未割当
+      const spouse = sorted.find(s =>
+        !assigned.has(s.index) &&
+        s.gender !== seed.gender &&
+        Math.abs(s.age - seed.age) <= 8 &&
+        s.age >= 20
+      );
+      if (spouse) {
+        memberSeeds.push(spouse);
+        assigned.add(spouse.index);
+      }
+
+      if (hhType === 'couple_with_child') {
+        const targetChildCount = sampleFromDistribution(STAT_CHILDREN_PER_FAMILY.dist).count;
+        let childCount = 0;
+        for (const s of sorted) {
+          if (childCount >= targetChildCount) break;
+          if (assigned.has(s.index)) continue;
+          const ageDiff = seed.age - s.age;
+          if (ageDiff >= 18 && ageDiff <= 40 && s.age <= 22) {
+            memberSeeds.push(s);
+            assigned.add(s.index);
+            childCount++;
+          }
+        }
+      }
     }
 
-    // 目標人数を超えないよう打ち切り
-    if (totalMembers + memberCount > targetAgentCount) {
-      memberCount = targetAgentCount - totalMembers;
-      if (memberCount <= 0) break;
+    if (hhType === 'single_parent') {
+      const targetChildCount = sampleFromDistribution(STAT_CHILDREN_PER_FAMILY.dist).count;
+      let childCount = 0;
+      for (const s of sorted) {
+        if (childCount >= targetChildCount) break;
+        if (assigned.has(s.index)) continue;
+        const ageDiff = seed.age - s.age;
+        if (ageDiff >= 18 && ageDiff <= 35 && s.age < 18) {
+          memberSeeds.push(s);
+          assigned.add(s.index);
+          childCount++;
+        }
+      }
     }
 
-    // 住居タイプ
+    if (hhType === 'three_generation') {
+      // 親世代（seed より20〜35歳下）
+      const parent = sorted.find(s =>
+        !assigned.has(s.index) &&
+        seed.age - s.age >= 20 && seed.age - s.age <= 40 &&
+        s.age >= 30
+      );
+      if (parent) {
+        memberSeeds.push(parent);
+        assigned.add(parent.index);
+        // 孫（親より15〜30歳下）
+        const grandchild = sorted.find(s =>
+          !assigned.has(s.index) &&
+          parent.age - s.age >= 15 && parent.age - s.age <= 30
+        );
+        if (grandchild) {
+          memberSeeds.push(grandchild);
+          assigned.add(grandchild.index);
+        }
+      }
+    }
+
+    // 住居情報
     const ownershipRate = STAT_HOME_OWNERSHIP_RATE_BY_REGION[region];
     const isOwner = Math.random() < ownershipRate;
-    let housingType, housingCostMonthly, mortgageRemaining;
+    const housingType = isOwner ? 'own' : (Math.random() < 0.15 ? 'public' : 'rent');
+    const housingCostMonthly = isOwner ? 0
+      : lognormalSample(STAT_MONTHLY_RENT_BY_REGION[region], 0.25);
+    const mortgageRemaining = isOwner && Math.random() < STAT_MORTGAGE_HOLDER_RATIO
+      ? lognormalSample(STAT_MORTGAGE_BALANCE_MEDIAN, 0.4)
+      : 0;
 
-    if (isOwner) {
-      housingType = 'own';
-      housingCostMonthly = 0; // ローン返済は別途
-      const hasMortgage = Math.random() < STAT_MORTGAGE_HOLDER_RATIO;
-      mortgageRemaining = hasMortgage
-        ? lognormalSample(STAT_MORTGAGE_BALANCE_MEDIAN, 0.4)
-        : 0;
-    } else {
-      const r = Math.random();
-      if (r < 0.040 / (1 - ownershipRate)) {
-        housingType = 'public';
-        housingCostMonthly = STAT_MONTHLY_RENT_BY_REGION[region] * 0.45;
-      } else if (r < (0.040 + 0.086) / (1 - ownershipRate)) {
-        housingType = 'family';
-        housingCostMonthly = STAT_MONTHLY_RENT_BY_REGION[region] * 0.30;
-      } else {
-        housingType = 'rent';
-        housingCostMonthly = lognormalSample(STAT_MONTHLY_RENT_BY_REGION[region], 0.25);
-      }
-      mortgageRemaining = 0;
-    }
-
-    const id = nextId('hh', hhCounter++);
-    households.push({
-      id,
+    const hh = {
+      id: hhId,
       type: hhType,
-      memberIds: [],           // agentFactory で埋める
+      memberIds: [],
       region,
       housingType,
       housingCostMonthly,
@@ -201,269 +229,161 @@ export function generateHouseholds(targetAgentCount = 1000) {
       receivingChildBenefit: false,
       receivingCarerAllowance: false,
       welfareNonReceiptReason: null,
-      _targetMemberCount: memberCount,
-    });
+      _memberSeeds: memberSeeds,
+    };
 
-    totalMembers += memberCount;
+    for (const s of memberSeeds) {
+      agentHouseholdMap[s.index] = hhId;
+    }
+    households.push(hh);
   }
 
-  return households;
+  // 未割当エージェントを単独世帯として処理
+  for (const seed of agentSeeds) {
+    if (assigned.has(seed.index)) continue;
+    const hhId = nextId('hh', hhCounter++);
+    const region = seed.region;
+    const ownershipRate = STAT_HOME_OWNERSHIP_RATE_BY_REGION[region];
+    const isOwner = Math.random() < ownershipRate;
+    const hh = {
+      id: hhId,
+      type: 'single',
+      memberIds: [],
+      region,
+      housingType: isOwner ? 'own' : 'rent',
+      housingCostMonthly: isOwner ? 0 : lognormalSample(STAT_MONTHLY_RENT_BY_REGION[region], 0.25),
+      mortgageRemaining: 0,
+      combinedIncome: 0,
+      combinedSavings: 0,
+      dependentCount: 0,
+      welfareEligible: false,
+      childBenefitEligible: false,
+      carerAllowanceEligible: false,
+      receivingWelfare: false,
+      receivingChildBenefit: false,
+      receivingCarerAllowance: false,
+      welfareNonReceiptReason: null,
+      _memberSeeds: [seed],
+    };
+    agentHouseholdMap[seed.index] = hhId;
+    households.push(hh);
+  }
+
+  return { households, agentHouseholdMap };
 }
 
-// ─── エージェント生成 ────────────────────────────────────────
+// ─── Step 4: エージェント生成（年齢・性別は確定済み） ─────────
 
-export function generateAgents(households) {
+function buildAgents(agentSeeds, households, agentHouseholdMap) {
   const agents = [];
-  let agCounter = 1;
+  const hhMap = Object.fromEntries(households.map(h => [h.id, h]));
   const CURRENT_YEAR = 2024;
+  let agCounter = 1;
 
-  for (const hh of households) {
-    const memberCount = hh._targetMemberCount;
-    const hhAgents = [];
+  for (const seed of agentSeeds) {
+    const { age, gender, region } = seed;
+    const birthYear = CURRENT_YEAR - age;
+    const hhId = agentHouseholdMap[seed.index];
+    const hh = hhMap[hhId];
+    if (!hh) continue;
 
-    for (let i = 0; i < memberCount; i++) {
-      const isHead = i === 0;
-      const age = sampleAge(hh, i, hhAgents, CURRENT_YEAR);
-      const birthYear = CURRENT_YEAR - age;
-      const gender = sampleGender(hh, i);
+    const education  = sampleEducation(birthYear, age);
+    const { employmentStatus, employmentType, industry } = sampleEmployment(gender, age, education);
+    const annualIncome = sampleAnnualIncome(gender, age, education, industry, employmentType, employmentStatus);
+    const savings = sampleSavings(age, annualIncome);
+    const baseMPC = sampleMPC(annualIncome);
+    const consumptionBasketFoodRatio = sampleFoodRatio(annualIncome);
+    const riskTolerance = weightedSample(
+      EST_RISK_TOLERANCE_DIST.map(d => ({ value: d.level, weight: d.weight }))
+    );
+    const publicServiceReliance = clamp(
+      gaussianRandom(EST_PUBLIC_SERVICE_RELIANCE_PARAMS.mean, EST_PUBLIC_SERVICE_RELIANCE_PARAMS.stdDev),
+      EST_PUBLIC_SERVICE_RELIANCE_PARAMS.min,
+      EST_PUBLIC_SERVICE_RELIANCE_PARAMS.max,
+    );
+    const baseLifeExpectancy = gender === 'M'
+      ? STAT_LIFE_EXPECTANCY.male
+      : STAT_LIFE_EXPECTANCY.female;
+    const health    = sampleHealth(age, annualIncome, employmentStatus);
+    const happiness = sampleHappiness(annualIncome, employmentStatus, region);
+    const govTrust  = sampleGovTrust(annualIncome, employmentStatus);
+    const occupationLevel = sampleOccupationLevel(age, education, employmentType);
 
-      // 学歴
-      const education = sampleEducation(birthYear, age);
+    const agent = {
+      id: nextId('ag', agCounter++),
+      householdId: hhId,
+      birthYear,
+      gender,
+      region,
+      education,
+      baseLifeExpectancy,
+      baseMPC,
+      riskTolerance,
+      publicServiceReliance,
+      employmentStatus,
+      employmentType,
+      industry,
+      occupationLevel,
+      turnsInCurrentJob: randomInt(0, 20),
+      annualIncome,
+      savings,
+      debtBalance: 0,
+      employmentIncomeDeduction: 0,
+      totalDeductions: 0,
+      taxableIncome: 0,
+      incomeTaxAnnual: 0,
+      incomeTaxAfterCredit: 0,
+      municipalTax: 0,
+      healthInsurancePremium: 0,
+      pensionPremium: 0,
+      employmentInsurancePremium: 0,
+      careInsurancePremium: 0,
+      eitcTaxCreditAmount: 0,
+      eitcCashBenefitAmount: 0,
+      effectiveConsumptionTaxRate: 0,
+      consumptionTaxBurdenAnnual: 0,
+      disposableIncome: annualIncome,
+      totalTaxBurden: 0,
+      effectiveTotalBurdenRate: 0,
+      netBenefitFromGov: 0,
+      semiannualConsumption: 0,
+      consumptionBasketFoodRatio,
+      health,
+      happiness,
+      govTrust,
+      isJobSeeking: employmentStatus === 'unemployed',
+      isOnParentalLeave: false,
+      policyEffectQueue: [],
+    };
 
-      // 就業状態
-      const { employmentStatus, employmentType, industry } = sampleEmployment(gender, age, education);
-
-      // 年収
-      const annualIncome = sampleAnnualIncome(gender, age, education, industry, employmentType, employmentStatus);
-
-      // 貯蓄
-      const savings = sampleSavings(age, annualIncome);
-
-      // 気質
-      const baseMPC = sampleMPC(annualIncome);
-      const consumptionBasketFoodRatio = sampleFoodRatio(annualIncome);
-      const riskTolerance = weightedSample(
-        EST_RISK_TOLERANCE_DIST.map(d => ({ value: d.level, weight: d.weight }))
-      );
-      const publicServiceReliance = clamp(
-        gaussianRandom(EST_PUBLIC_SERVICE_RELIANCE_PARAMS.mean, EST_PUBLIC_SERVICE_RELIANCE_PARAMS.stdDev),
-        EST_PUBLIC_SERVICE_RELIANCE_PARAMS.min,
-        EST_PUBLIC_SERVICE_RELIANCE_PARAMS.max,
-      );
-
-      // 平均余命
-      const baseLifeExpectancy = gender === 'M'
-        ? STAT_LIFE_EXPECTANCY.male
-        : STAT_LIFE_EXPECTANCY.female;
-
-      // 健康・幸福・政府信頼
-      const health = sampleHealth(age, annualIncome, employmentStatus);
-      const happiness = sampleHappiness(annualIncome, employmentStatus, hh.region);
-      const govTrust = sampleGovTrust(annualIncome, employmentStatus);
-
-      // 職業レベル
-      const occupationLevel = sampleOccupationLevel(age, education, employmentType);
-
-      const agent = {
-        // 不変
-        id: nextId('ag', agCounter++),
-        householdId: hh.id,
-        birthYear,
-        gender,
-        region: hh.region,
-        education,
-        baseLifeExpectancy,
-
-        // 気質
-        baseMPC,
-        riskTolerance,
-        publicServiceReliance,
-
-        // 就業
-        employmentStatus,
-        employmentType,
-        industry,
-        occupationLevel,
-        turnsInCurrentJob: randomInt(0, 20),
-
-        // 所得・資産
-        annualIncome,
-        savings,
-        debtBalance: 0,
-
-        // 税計算結果（TaxCalculator が毎ターン更新）
-        employmentIncomeDeduction: 0,
-        totalDeductions: 0,
-        taxableIncome: 0,
-        incomeTaxAnnual: 0,
-        incomeTaxAfterCredit: 0,
-        municipalTax: 0,
-        healthInsurancePremium: 0,
-        pensionPremium: 0,
-        employmentInsurancePremium: 0,
-        careInsurancePremium: 0,
-        eitcTaxCreditAmount: 0,
-        eitcCashBenefitAmount: 0,
-        effectiveConsumptionTaxRate: 0,
-        consumptionTaxBurdenAnnual: 0,
-        disposableIncome: annualIncome, // 税計算前の仮値
-        totalTaxBurden: 0,
-        effectiveTotalBurdenRate: 0,
-        netBenefitFromGov: 0,
-
-        // 消費
-        semiannualConsumption: 0,
-        consumptionBasketFoodRatio,
-
-        // 社会
-        health,
-        happiness,
-        govTrust,
-
-        // ライフイベント
-        isJobSeeking: employmentStatus === 'unemployed',
-        isOnParentalLeave: false,
-
-        // エンジン内部
-        policyEffectQueue: [],
-      };
-
-      hhAgents.push(agent);
-      agents.push(agent);
-      hh.memberIds.push(agent.id);
-    }
-
-    // 世帯集計値を初期化
-    updateHouseholdAggregates(hh, hhAgents);
+    agents.push(agent);
+    hh.memberIds.push(agent.id);
   }
 
   return agents;
 }
 
-// ─── 年齢サンプリング ────────────────────────────────────────
-
-function sampleAge(hh, memberIndex, existingAgents, currentYear) {
-  const p = EST_HOUSEHOLD_AGE_PARAMS.headAgeDistribution;
-  const type = hh.type;
-
-  if (memberIndex === 0) {
-    // 世帯主
-    switch (type) {
-      case 'single':
-        return sampleSingleAge(hh.region);
-      case 'couple':
-      case 'couple_with_child': {
-        const headP = p[type].head;
-        return clamp(Math.round(gaussianRandom(headP.mean, headP.stdDev)), headP.ageMin, headP.ageMax);
-      }
-      case 'single_parent': {
-        const headP = p.single_parent.head;
-        return clamp(Math.round(gaussianRandom(headP.mean, headP.stdDev)), headP.ageMin, headP.ageMax);
-      }
-      case 'three_generation': {
-        const headP = p.three_generation.grandparent;
-        return clamp(Math.round(gaussianRandom(headP.mean, headP.stdDev)), headP.ageMin, headP.ageMax);
-      }
-      default: {
-        // other
-        const age = clamp(Math.round(gaussianRandom(45, 15)), 20, 85);
-        return age;
-      }
-    }
-  }
-
-  // 2人目以降
-  const headAge = existingAgents[0] ? currentYear - existingAgents[0].birthYear : 45;
-
-  if (type === 'couple' || type === 'couple_with_child') {
-    if (memberIndex === 1) {
-      // 配偶者
-      const diff = Math.round(gaussianRandom(p[type].spouseAgeDiff.mean, p[type].spouseAgeDiff.stdDev));
-      return clamp(headAge + diff, 20, 95);
-    } else {
-      // 子ども
-      const offset = EST_HOUSEHOLD_AGE_PARAMS.childAgeOffset;
-      const childAge = headAge - Math.round(gaussianRandom(offset.mean, offset.stdDev))
-        - (memberIndex - 2) * randomInt(1, 4);
-      return Math.max(0, childAge);
-    }
-  }
-
-  if (type === 'single_parent') {
-    const offset = EST_HOUSEHOLD_AGE_PARAMS.childAgeOffset;
-    const childAge = headAge - Math.round(gaussianRandom(offset.mean, offset.stdDev))
-      - (memberIndex - 1) * randomInt(1, 4);
-    return Math.max(0, childAge);
-  }
-
-  if (type === 'three_generation') {
-    if (memberIndex === 1) {
-      // 2世代目（親世代）
-      const parentP = p.three_generation.parent;
-      return clamp(Math.round(gaussianRandom(parentP.mean, parentP.stdDev)), parentP.ageMin, parentP.ageMax);
-    } else if (memberIndex === 2) {
-      // 3世代目の配偶者
-      const parentAge = currentYear - existingAgents[1].birthYear;
-      return clamp(parentAge + Math.round(gaussianRandom(-2, 3)), 30, 65);
-    } else {
-      // 孫
-      const parentAge = existingAgents[1] ? currentYear - existingAgents[1].birthYear : 46;
-      const offset = EST_HOUSEHOLD_AGE_PARAMS.childAgeOffset;
-      return Math.max(0, parentAge - Math.round(gaussianRandom(offset.mean, offset.stdDev)) - (memberIndex - 3) * 2);
-    }
-  }
-
-  // other
-  return clamp(Math.round(gaussianRandom(45, 15)), 15, 85);
-}
-
-// ─── 性別サンプリング ────────────────────────────────────────
-
-function sampleGender(hh, memberIndex) {
-  if (hh.type === 'single_parent') {
-    if (memberIndex === 0) {
-      return Math.random() < STAT_SINGLE_PARENT_MOTHER_RATIO ? 'F' : 'M';
-    }
-  }
-  if (hh.type === 'couple' || hh.type === 'couple_with_child' || hh.type === 'three_generation') {
-    // 世帯主 M、配偶者 F（簡略化）
-    if (memberIndex === 0) return 'M';
-    if (memberIndex === 1) return 'F';
-    if (memberIndex === 2 && hh.type === 'three_generation') return 'F'; // 嫁
-  }
-  return Math.random() < STAT_SEX_RATIO.male ? 'M' : 'F';
-}
-
-// ─── 学歴サンプリング ────────────────────────────────────────
+// ─── 属性サンプリング関数群 ──────────────────────────────────
 
 function sampleEducation(birthYear, age) {
-  if (age < 15) return 'middle_school'; // 義務教育中
-  if (age < 18) return 'high_school';   // 高校在学中相当
+  if (age < 15) return 'middle_school';
+  if (age < 18) return 'high_school';
   if (age < 22) {
-    // 在学中の可能性
     const uniRate = getUniversityRateByCohort(birthYear);
     return Math.random() < uniRate ? 'university' : 'high_school';
   }
-
-  // 25歳以上：コーホート補正あり学歴分布
   const uniRate = getUniversityRateByCohort(birthYear);
-  const scaleFactor = uniRate / 0.537; // 基準年（1990年代生）との比率
-
-  // 大卒＋大学院率を調整
+  const scaleFactor = uniRate / 0.537;
   const adjDist = STAT_EDUCATION_DISTRIBUTION_ADULT.map(d => {
     if (d.level === 'university' || d.level === 'graduate') {
       return { ...d, ratio: d.ratio * scaleFactor };
     }
     return d;
   });
-  // 合計を1に正規化
   const total = adjDist.reduce((s, d) => s + d.ratio, 0);
   const normDist = adjDist.map(d => ({ ...d, ratio: d.ratio / total }));
-
   return sampleFromDistribution(normDist).level;
 }
-
-// ─── 就業状態サンプリング ────────────────────────────────────
 
 function sampleEmployment(gender, age, education) {
   if (age < 15) {
@@ -480,45 +400,34 @@ function sampleEmployment(gender, age, education) {
       : { employmentStatus: 'employed', employmentType: 'nonregular', industry: sampleIndustry() };
   }
 
-  if (age >= 75) {
-    const lfRate = getLaborForceRate(gender, age);
-    if (Math.random() > lfRate) {
-      return { employmentStatus: 'retired', employmentType: null, industry: null };
-    }
-  }
-
   const lfRate = getLaborForceRate(gender, age);
   if (Math.random() > lfRate) {
-    // 非労働力
     const status = age >= 65 ? 'retired' : 'inactive';
     return { employmentStatus: status, employmentType: null, industry: null };
   }
 
-  // 労働力人口内：失業 or 就業
   const unempRate = getUnemploymentRate(age);
   if (Math.random() < unempRate) {
     return { employmentStatus: 'unemployed', employmentType: null, industry: null };
   }
 
-  // 就業：雇用形態
   const regularRate = getRegularRate(gender, age);
   const employmentType = Math.random() < regularRate ? 'regular' : 'nonregular';
-  const industry = sampleIndustry();
-
-  return { employmentStatus: 'employed', employmentType, industry };
+  return { employmentStatus: 'employed', employmentType, industry: sampleIndustry() };
 }
 
 function sampleIndustry() {
   return sampleFromDistribution(STAT_INDUSTRY_DISTRIBUTION).industry;
 }
 
-// ─── 職業レベルサンプリング ──────────────────────────────────
-
 function sampleOccupationLevel(age, education, employmentType) {
   if (employmentType !== 'regular') return 'entry';
   if (age < 28) return 'entry';
   if (age < 35) return Math.random() < 0.7 ? 'entry' : 'mid';
-  if (age < 45) return Math.random() < 0.5 ? 'mid' : (Math.random() < 0.3 ? 'senior' : 'entry');
+  if (age < 45) {
+    const r = Math.random();
+    return r < 0.50 ? 'mid' : r < 0.80 ? 'senior' : 'entry';
+  }
   if (age < 55) {
     const r = Math.random();
     if (education === 'graduate' || education === 'university') {
@@ -529,11 +438,8 @@ function sampleOccupationLevel(age, education, employmentType) {
   return Math.random() < 0.10 ? 'executive' : Math.random() < 0.45 ? 'senior' : 'mid';
 }
 
-// ─── 年収サンプリング ────────────────────────────────────────
-
 function sampleAnnualIncome(gender, age, education, industry, employmentType, employmentStatus) {
-  if (employmentStatus !== 'employed') return 0;
-  if (employmentType === null) return 0;
+  if (employmentStatus !== 'employed' || employmentType === null) return 0;
 
   const ageKey = floorKey(EST_AGE_INCOME_INDEX, age);
   const ageIndex = EST_AGE_INCOME_INDEX[ageKey] ?? 0.51;
@@ -543,57 +449,49 @@ function sampleAnnualIncome(gender, age, education, industry, employmentType, em
   const typeFactor = employmentType === 'nonregular' ? EST_NONREGULAR_INCOME_FACTOR : 1.0;
 
   const median = EST_BASE_ANNUAL_INCOME * ageIndex * eduFactor * indFactor * genderFactor * typeFactor;
-  const income = lognormalSample(median, EST_INCOME_LOGNORMAL_SIGMA);
-  return Math.max(0, Math.round(income));
+  return Math.max(0, Math.round(lognormalSample(median, EST_INCOME_LOGNORMAL_SIGMA)));
 }
-
-// ─── 貯蓄サンプリング ────────────────────────────────────────
 
 function sampleSavings(age, annualIncome) {
-  const ageFloor = floorKey(STAT_SAVINGS_BALANCE_BY_AGE, Math.max(30, age));
-  const medianManyen = STAT_SAVINGS_BALANCE_BY_AGE[ageFloor] ?? STAT_SAVINGS_BALANCE_BY_AGE.overall;
+  // 'overall' など非数値キーを除外してから参照する
+  const numericTable = Object.fromEntries(
+    Object.entries(STAT_SAVINGS_BALANCE_BY_AGE)
+      .filter(([k]) => !isNaN(Number(k)))
+      .map(([k, v]) => [Number(k), v])
+  );
+  const ageFloor = floorKey(numericTable, Math.max(30, age));
+  const medianManyen = numericTable[ageFloor] ?? 660;
   const median = medianManyen * 10_000;
-  const raw = lognormalSample(median, EST_SAVINGS_LOGNORMAL_SIGMA);
-  return Math.max(0, Math.round(raw));
+  return Math.max(0, Math.round(lognormalSample(median, EST_SAVINGS_LOGNORMAL_SIGMA)));
 }
-
-// ─── MPC サンプリング ────────────────────────────────────────
 
 function sampleMPC(annualIncome) {
   const p = EST_MPC_PARAMS;
-  const income = Math.max(annualIncome, 100_000); // ゼロ除算ガード
+  const income = Math.max(annualIncome, 100_000);
   const base = p.intercept + p.incomeElasticity * Math.log10(income / p.referenceIncome);
-  const noise = gaussianRandom(0, p.noiseStdDev);
-  return clamp(base + noise, p.min, p.max);
+  return clamp(base + gaussianRandom(0, p.noiseStdDev), p.min, p.max);
 }
-
-// ─── エンゲル係数サンプリング ────────────────────────────────
 
 function sampleFoodRatio(annualIncome) {
   const p = EST_ENGEL_COEFFICIENT_PARAMS;
   const income = Math.max(annualIncome, 100_000);
-  const ratio = p.intercept + p.incomeElasticity * Math.log10(income / p.referenceIncome);
-  return clamp(ratio, p.min, p.max);
+  return clamp(
+    p.intercept + p.incomeElasticity * Math.log10(income / p.referenceIncome),
+    p.min, p.max,
+  );
 }
-
-// ─── 健康度サンプリング ──────────────────────────────────────
 
 function sampleHealth(age, annualIncome, employmentStatus) {
   const p = EST_HEALTH_PARAMS;
   const ageKey = floorKey(p.baseByAge, age);
   const base = p.baseByAge[ageKey] ?? 50;
-
   const incomeAdj = annualIncome < 2_000_000 ? p.incomeAdjustment.under2m
     : annualIncome < 4_000_000 ? p.incomeAdjustment['2m_4m']
     : annualIncome < 6_000_000 ? p.incomeAdjustment['4m_6m']
     : p.incomeAdjustment.over6m;
-
   const empAdj = p.employmentAdjustment[employmentStatus] ?? 0;
-  const noise = gaussianRandom(0, p.noiseStdDev);
-  return clamp(base + incomeAdj + empAdj + noise, p.min, p.max);
+  return clamp(base + incomeAdj + empAdj + gaussianRandom(0, p.noiseStdDev), p.min, p.max);
 }
-
-// ─── 幸福度サンプリング ──────────────────────────────────────
 
 function sampleHappiness(annualIncome, employmentStatus, region) {
   const p = EST_HAPPINESS_PARAMS;
@@ -604,11 +502,8 @@ function sampleHappiness(annualIncome, employmentStatus, region) {
   );
   const empScore = p.employmentScore[employmentStatus] ?? 0;
   const regionScore = p.regionScore[region] ?? 0;
-  const noise = gaussianRandom(0, p.noiseStdDev);
-  return clamp(p.baseScore + incomeScore + empScore + regionScore + noise, p.min, p.max);
+  return clamp(p.baseScore + incomeScore + empScore + regionScore + gaussianRandom(0, p.noiseStdDev), p.min, p.max);
 }
-
-// ─── 政府信頼度サンプリング ──────────────────────────────────
 
 function sampleGovTrust(annualIncome, employmentStatus) {
   const p = EST_GOV_TRUST_PARAMS;
@@ -617,8 +512,10 @@ function sampleGovTrust(annualIncome, employmentStatus) {
     : annualIncome < 6_000_000 ? p.incomeAdjustment['4m_6m']
     : p.incomeAdjustment.over6m;
   const empAdj = p.employmentAdjustment[employmentStatus] ?? 0;
-  const score = gaussianRandom(p.baseMean + incomeAdj + empAdj, p.baseStdDev);
-  return clamp(score, p.min, p.max);
+  return clamp(
+    gaussianRandom(p.baseMean + incomeAdj + empAdj, p.baseStdDev),
+    p.min, p.max,
+  );
 }
 
 // ─── 世帯集計値の更新 ────────────────────────────────────────
@@ -629,8 +526,6 @@ export function updateHouseholdAggregates(household, agents) {
 
   household.combinedIncome = members.reduce((s, a) => s + a.annualIncome, 0);
   household.combinedSavings = members.reduce((s, a) => s + a.savings, 0);
-
-  // 扶養人数：15歳未満 または 扶養控除適用年齢
   household.dependentCount = members.filter(a => {
     const age = CURRENT_YEAR - a.birthYear;
     return age < 16 || (age >= 16 && a.employmentStatus === 'student' && age < 23);
@@ -668,34 +563,44 @@ export function applyWelfareTakeup(household, policy) {
   }
 }
 
-// 生活保護の最低生活費基準（簡略モデル）
-// @note 実際の基準額は地域・世帯構成によって複雑に変わる。
-//       ここでは第1類（個人費）+第2類（世帯費）の概算を使用。
+// @adjustment 捕捉率が低すぎたため閾値を引き上げ（Fix 4）
 function calcWelfareThreshold(region, dependentCount) {
   const BASE = {
-    urban:    1_560_000, // 1級地-1（東京23区等）の単身基準×12ヶ月
-    suburban: 1_440_000, // 2級地
-    rural:    1_320_000, // 3級地
+    urban:    1_800_000,
+    suburban: 1_650_000,
+    rural:    1_500_000,
   };
   const base = BASE[region] ?? BASE.suburban;
-  const perDependent = 300_000; // 扶養1人あたり加算（概算）
+  const perDependent = 380_000;
   return base + perDependent * dependentCount;
 }
 
 // ─── エントリポイント ────────────────────────────────────────
 
 export function generateSimulation(targetAgentCount = 1000, taxPolicy = null) {
-  const households = generateHouseholds(targetAgentCount);
-  const agents = generateAgents(households);
+  // Step 1: 全エージェントの年齢・性別・地域を先にサンプリング
+  const agentSeeds = sampleAgeDemographics(targetAgentCount);
 
-  // 捕捉率ロジック適用
+  // Step 2: 年齢が近いエージェントを世帯にグループ化
+  const { households, agentHouseholdMap } = buildHouseholdsFromDemographics(agentSeeds);
+
+  // Step 3: 各エージェントを生成
+  const agents = buildAgents(agentSeeds, households, agentHouseholdMap);
+
+  // Step 4: 世帯集計値を更新
+  for (const hh of households) {
+    const members = agents.filter(a => a.householdId === hh.id);
+    updateHouseholdAggregates(hh, members);
+  }
+
+  // Step 5: 捕捉率ロジック
   for (const hh of households) {
     applyWelfareTakeup(hh, taxPolicy ?? {});
   }
 
-  // _targetMemberCount は内部用なので削除
   for (const hh of households) {
     delete hh._targetMemberCount;
+    delete hh._memberSeeds;
   }
 
   return { agents, households };
