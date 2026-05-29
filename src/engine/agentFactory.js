@@ -575,6 +575,113 @@ function calcWelfareThreshold(region, dependentCount) {
   return base + perDependent * dependentCount;
 }
 
+// ─── ポストプロセス：失業率クォータ補正 ──────────────────────
+
+export function applyUnemploymentQuota(agents) {
+  const CURRENT_YEAR = 2024;
+
+  const laborForce = agents.filter(a =>
+    a.employmentStatus === 'employed' || a.employmentStatus === 'unemployed'
+  );
+  if (laborForce.length === 0) return;
+
+  // 全員をいったん就業にリセット
+  for (const a of laborForce) {
+    a.employmentStatus = 'employed';
+    a.isJobSeeking = false;
+  }
+
+  const ageBucketKeys = Object.keys(STAT_UNEMPLOYMENT_RATE.by_age)
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  const buckets = {};
+  for (const agent of laborForce) {
+    const age = CURRENT_YEAR - agent.birthYear;
+    let bucketKey = ageBucketKeys[0];
+    for (const k of ageBucketKeys) {
+      if (k <= age) bucketKey = k;
+      else break;
+    }
+    if (!buckets[bucketKey]) buckets[bucketKey] = [];
+    buckets[bucketKey].push(agent);
+  }
+
+  for (const [bucketKey, bucketAgents] of Object.entries(buckets)) {
+    const rate = STAT_UNEMPLOYMENT_RATE.by_age[Number(bucketKey)]
+      ?? STAT_UNEMPLOYMENT_RATE.overall;
+    const targetCount = Math.round(bucketAgents.length * rate);
+    const shuffled = [...bucketAgents].sort(() => Math.random() - 0.5);
+    for (let i = 0; i < Math.min(targetCount, shuffled.length); i++) {
+      shuffled[i].employmentStatus = 'unemployed';
+      shuffled[i].employmentType   = null;
+      shuffled[i].industry         = null;
+      shuffled[i].isJobSeeking     = true;
+    }
+  }
+}
+
+// ─── ポストプロセス：非正規雇用率クォータ補正 ────────────────
+
+export function applyEmploymentTypeQuota(agents) {
+  const CURRENT_YEAR = 2024;
+
+  const employed = agents.filter(a => a.employmentStatus === 'employed');
+  if (employed.length === 0) return;
+
+  const groups = {};
+  for (const agent of employed) {
+    const age = CURRENT_YEAR - agent.birthYear;
+    const tableKey = agent.gender === 'M' ? 'male' : 'female';
+    const ageBucketKeys = Object.keys(STAT_REGULAR_EMPLOYMENT_RATE[tableKey])
+      .map(Number)
+      .sort((a, b) => a - b);
+    let bucketKey = ageBucketKeys[0];
+    for (const k of ageBucketKeys) {
+      if (k <= age) bucketKey = k;
+      else break;
+    }
+    const groupKey = `${agent.gender}_${bucketKey}`;
+    if (!groups[groupKey]) groups[groupKey] = { agents: [], gender: agent.gender, bucketKey };
+    groups[groupKey].agents.push(agent);
+  }
+
+  for (const { agents: groupAgents, gender, bucketKey } of Object.values(groups)) {
+    const table = STAT_REGULAR_EMPLOYMENT_RATE[gender === 'M' ? 'male' : 'female'];
+    const regularRate = table[bucketKey] ?? 0.6;
+    const targetRegularCount = Math.round(groupAgents.length * regularRate);
+    const shuffled = [...groupAgents].sort(() => Math.random() - 0.5);
+    for (let i = 0; i < shuffled.length; i++) {
+      shuffled[i].employmentType = i < targetRegularCount ? 'regular' : 'nonregular';
+    }
+  }
+}
+
+// ─── ポストプロセス：雇用形態変更後の年収再計算 ──────────────
+
+function recalculateIncomeAfterTypeChange(agents) {
+  const CURRENT_YEAR = 2024;
+
+  for (const agent of agents) {
+    if (agent.employmentStatus !== 'employed') {
+      agent.annualIncome = 0;
+      continue;
+    }
+    const age = CURRENT_YEAR - agent.birthYear;
+    if (!agent.industry && agent.employmentType) {
+      agent.industry = sampleIndustry();
+    }
+    agent.annualIncome = sampleAnnualIncome(
+      agent.gender,
+      age,
+      agent.education,
+      agent.industry ?? sampleIndustry(),
+      agent.employmentType,
+      agent.employmentStatus,
+    );
+  }
+}
+
 // ─── エントリポイント ────────────────────────────────────────
 
 export function generateSimulation(targetAgentCount = 1000, taxPolicy = null) {
@@ -593,8 +700,17 @@ export function generateSimulation(targetAgentCount = 1000, taxPolicy = null) {
     updateHouseholdAggregates(hh, members);
   }
 
-  // Step 5: 捕捉率ロジック
+  // Step 5: 失業率・雇用形態をクォータ制で補正
+  applyUnemploymentQuota(agents);
+  applyEmploymentTypeQuota(agents);
+
+  // Step 6: 雇用形態変更後の年収を再計算
+  recalculateIncomeAfterTypeChange(agents);
+
+  // Step 7: 世帯集計値を再更新（年収変更後）してから捕捉率適用
   for (const hh of households) {
+    const members = agents.filter(a => a.householdId === hh.id);
+    updateHouseholdAggregates(hh, members);
     applyWelfareTakeup(hh, taxPolicy ?? {});
   }
 
